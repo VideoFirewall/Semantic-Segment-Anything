@@ -1,9 +1,12 @@
 import os
+import csv
+import time
 import argparse
 import torch
+import pandas as pd
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
-from pipeline import semantic_segment_anything_inference, eval_pipeline, img_load
+from pipeline import semantic_segment_anything_inference, eval_pipeline, img_load, perturb
 from configs.ade20k_id2label import CONFIG as CONFIG_ADE20K_ID2LABEL
 from configs.cityscapes_id2label import CONFIG as CONFIG_CITYSCAPES_ID2LABEL
 
@@ -23,11 +26,14 @@ def parse_args():
     parser.add_argument('--eval', default=False, action='store_true', help='whether to execute evalution')
     parser.add_argument('--gt_path', default=None, help='specify the path to gt annotations')
     parser.add_argument('--model', type=str, default='segformer', choices=['oneformer', 'segformer'], help='specify the semantic branch model')
+    parser.add_argument('--UAP_method', type=str, default='Upscaled', choices=['Upscaled', 'Tiled'], help='specify the method to apply UAP')
+    parser.add_argument('--UAP_path', default=None, help='specify the path to UAP')
     args = parser.parse_args()
     return args
-    
+
 def main(rank, args):
-    dist.init_process_group("nccl", rank=rank, world_size=args.world_size)
+    dist.init_process_group("gloo", init_method="env://?use_libuv=False", rank=rank, world_size=args.world_size)
+    # dist.init_process_group("nccl", rank=rank, world_size=args.world_size)
     
     sam = sam_model_registry["vit_h"](checkpoint=args.ckpt_path).to(rank)
 
@@ -90,24 +96,49 @@ def main(rank, args):
     print('[Image name loaded] get image filename list.')
     print('[SSA start] model inference starts.')
 
+
+    rep = 3
+    csv_file = f"{args.out_dir}_rep={rep}.csv"
+    # runtime = 0
     for i, file_name in enumerate(local_filenames):
         print('[Runing] ', i, '/', len(local_filenames), ' ', file_name, ' on rank ', rank, '/', args.world_size)
         img = img_load(args.data_dir, file_name, args.dataset)
+
+        # Attack takes place here
+        if args.UAP_path and os.path.exists(args.UAP_path):
+            print('[Attack] ', args.UAP_method, ' attack on ', file_name)
+            img = perturb(img, args.UAP_path, args.UAP_method)
+
         if args.dataset == 'ade20k':
             id2label = CONFIG_ADE20K_ID2LABEL
         elif args.dataset == 'cityscapes' or args.dataset == 'foggy_driving':
             id2label = CONFIG_CITYSCAPES_ID2LABEL
         else:
             raise NotImplementedError()
+        
         with torch.no_grad():
-            semantic_segment_anything_inference(file_name, args.out_dir, rank, img=img, save_img=args.save_img,
-                                   semantic_branch_processor=semantic_branch_processor,
-                                   semantic_branch_model=semantic_branch_model,
-                                   mask_branch_model=mask_branch_model,
-                                   dataset=args.dataset,
-                                   id2label=id2label,
-                                   model=args.model)
+            start = time.time()
+            for _ in range(rep):
+                semantic_segment_anything_inference(file_name, args.out_dir, rank, img=img, save_img=args.save_img,
+                                    semantic_branch_processor=semantic_branch_processor,
+                                    semantic_branch_model=semantic_branch_model,
+                                    mask_branch_model=mask_branch_model,
+                                    dataset=args.dataset,
+                                    id2label=id2label,
+                                    model=args.model)
+            mean_img_runtime = (time.time() - start) / rep
+            with open(csv_file, "a", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([i, mean_img_runtime])
         # torch.cuda.empty_cache()
+    df = pd.read_csv(csv_file, header=None)
+    print(f"Mean runtime of {len(local_filenames)} images of {args.data_dir} folder out of {rep} reps: {df.iloc[:, 1].mean():.2f} seconds")
+    # mean_runtime = runtime / (rep * len(local_filenames))
+    # print(f"Runtime of {len(local_filenames)} images of {args.data_dir} folder: {mean_runtime:.2f} seconds")
+    # with open("print.txt", "a") as file:
+    #     file.write(f"Mean runtime of {len(local_filenames)} images of {args.data_dir} folder from {rep} repetitions: {mean_runtime:.2f} seconds. \n")
+
+    
     if args.eval and rank==0:
         assert args.gt_path is not None
         eval_pipeline(args.gt_path, args.out_dir, args.dataset)

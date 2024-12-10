@@ -7,7 +7,7 @@ def clipseg_segmentation(image, class_list, clipseg_processor, clipseg_model, ra
         padding=True, return_tensors="pt").to(rank)
     # resize inputs['pixel_values'] to the longesr side of inputs['pixel_values']
     h, w = inputs['pixel_values'].shape[-2:]
-    fixed_scale = (512, 512)
+    fixed_scale = (224, 224)
     inputs['pixel_values'] = F.interpolate(
         inputs['pixel_values'],
         size=fixed_scale,

@@ -19,12 +19,93 @@ from oneformer import oneformer_coco_segmentation, oneformer_ade20k_segmentation
 from blip import open_vocabulary_classification_blip
 from segformer import segformer_segmentation as segformer_func
 
+import cv2
+import numpy as np
+import torchvision.transforms as T
+
 oneformer_func = {
     'ade20k': oneformer_ade20k_segmentation,
     'coco': oneformer_coco_segmentation,
     'cityscapes': oneformer_cityscapes_segmentation,
     'foggy_driving': oneformer_cityscapes_segmentation
 }
+
+def imshow_det_bboxes_with_masks(
+    img, bboxes, labels, masks, class_names=None, colors=None, thickness=2, label_position="mask", show=True, out_file=None
+):
+    """
+    Draw bounding boxes and masks on the image with labels at the specified position.
+
+    Args:
+        img (numpy.ndarray): The image to draw on.
+        bboxes (list of list of int): Bounding boxes, each represented as [x1, y1, w, h].
+        labels (list of int): Labels for each bounding box.
+        masks (numpy.ndarray): Masks for each bounding box.
+        class_names (list of str, optional): Class names for each label.
+        colors (list of tuple of int, optional): Colors for each bounding box in BGR format.
+        thickness (int, optional): Thickness of the bounding box lines.
+        label_position (str, optional): Where to place the label ('bbox' or 'mask').
+        show (bool, optional): Whether to display the image.
+        out_file (str, optional): Path to save the image.
+    """
+    assert len(bboxes) == len(labels) == len(masks), "Lengths of bboxes, labels, and masks must match."
+
+    if colors is None:
+        # Generate random colors if not provided
+        colors = [tuple(np.random.randint(0, 255, 3).tolist()) for _ in range(len(bboxes))]
+
+    for bbox, label, mask, color in zip(bboxes, labels, masks, colors):
+        x1, y1, w, h = bbox
+        x2 = x1 + w
+        y2 = y1 + h
+
+        # Draw bounding box
+        # cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+        # Calculate label position
+        if label_position == "bbox":
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+        elif label_position == "mask":
+            mask_indices = np.argwhere(mask)
+            if mask_indices.size > 0:
+                center_y, center_x = mask_indices.mean(axis=0).astype(int)
+            else:
+                # Fallback to bounding box center if mask is empty
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+        else:
+            raise ValueError("label_position must be 'bbox' or 'mask'.")
+
+        # Draw label
+        if class_names:
+            label_text = class_names[label]
+            (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            text_x = center_x - text_width // 2
+            text_y = center_y + text_height // 2
+            cv2.rectangle(
+                img,
+                (text_x, text_y - text_height - baseline),
+                (text_x + text_width, text_y + baseline),
+                (0, 0, 0),
+                thickness=cv2.FILLED,
+            )
+            cv2.putText(img, label_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # Apply mask with alpha blending
+        mask = mask.astype(bool)
+        alpha = 0.5  # Transparency level for masks
+        img[mask] = (1 - alpha) * img[mask] + alpha * np.array(color)
+
+    # Show or save the result
+    if show:
+        cv2.imshow('Detections', img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    if out_file:
+        cv2.imwrite(out_file, img)
+
 
 def load_filename_with_extensions(data_path, filename):
     """
@@ -63,10 +144,22 @@ def semantic_annotation_pipeline(filename, data_path, output_path, rank, save_im
     if mask_generator is None:
         anns = mmcv.load(os.path.join(data_path, filename+'.json'))
     else:
+        # start = time.time()
+        # for _ in range(10):
         anns = {'annotations': mask_generator.generate(img)}
-    bitmasks, class_names = [], []
+        # runtime = (time.time() - start) / 10
+        # print(f"SAM Runtime of {data_path} image having {len(anns['annotations'])}: {runtime:.2f} seconds")
+    bitmasks, class_names, bboxes = [], [], []
+    
+    # start = time.time()
+    # for _ in range(10):
     class_ids_from_oneformer_coco = oneformer_coco_segmentation(Image.fromarray(img),oneformer_coco_processor,oneformer_coco_model, rank)
     class_ids_from_oneformer_ade20k = oneformer_ade20k_segmentation(Image.fromarray(img),oneformer_ade20k_processor,oneformer_ade20k_model, rank)
+    # runtime = (time.time() - start) / 10
+    # print(f"Semantic Seg Runtime of {data_path} image: {runtime:.2f} seconds")
+
+    # start = time.time()
+    # for _ in range(10):
     for ann in anns['annotations']:
         valid_mask = torch.tensor(maskUtils.decode(ann['segmentation'])).bool()
         # get the class ids of the valid pixels
@@ -105,6 +198,7 @@ def semantic_annotation_pipeline(filename, data_path, output_path, rank, save_im
         ann['class_name'] = str(top_1_mask_category)
         ann['class_proposals'] = mask_categories
         class_names.append(str(top_1_mask_category))
+        bboxes.append(ann['bbox'])
         # bitmasks.append(maskUtils.decode(ann['segmentation']))
 
         # Delete variables that are no longer needed
@@ -119,7 +213,8 @@ def semantic_annotation_pipeline(filename, data_path, output_path, rank, save_im
         del op_class_list
         del mask_categories
         del class_ids_patch_huge
-        
+    # runtime = (time.time() - start) / 10
+    # print(f"Semantic Voting Runtime of {data_path} image: {runtime:.2f} seconds")
     mmcv.dump(anns, os.path.join(output_path, filename + '_semantic.json'))
     print('[Save] save SSA-engine annotation results: ', os.path.join(output_path, filename + '_semantic.json'))
     if save_img:
@@ -150,6 +245,44 @@ def img_load(data_path, filename, dataset):
         raise NotImplementedError()
     return img
 
+def generate_tile(clean_tensor: torch.Tensor, UAP_tensor: torch.Tensor):
+    adv_height, adv_width = UAP_tensor.size(1), UAP_tensor.size(2)
+    clean_height, clean_width = clean_tensor.size(1), clean_tensor.size(2)
+    num_copies_horizontally = int(np.ceil(clean_width / adv_width))
+    num_copies_vertically = int(np.ceil(clean_height / adv_height))
+    adv_patch_h = UAP_tensor
+    for i in range(num_copies_horizontally - 1):
+        adv_patch_h = torch.cat((adv_patch_h, UAP_tensor), dim=2)
+    adv_patch_v = adv_patch_h
+    for i in range(num_copies_vertically - 1):
+        adv_patch_v = torch.cat((adv_patch_v, adv_patch_h), dim=1)
+    tiled_UAP_tensor = adv_patch_v[:, :clean_height, :clean_width]
+
+    return tiled_UAP_tensor
+
+def perturb(image: np.array, uap_path: str, uap_method: str = 'Upscaled') -> np.array:
+        img_tensor = T.ToTensor()(Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))) 
+        _, height, width = img_tensor.shape
+        
+        UAP_img = mmcv.imread(uap_path)
+        UAP_arr = Image.fromarray(cv2.cvtColor(UAP_img, cv2.COLOR_BGR2RGB))
+        if uap_method == 'Upscaled':
+            preprocess = T.Compose([
+                T.Resize((height, width)),
+                T.ToTensor(),
+            ])
+            UAP_tensor = preprocess(UAP_arr)
+        elif uap_method == 'Tiled':
+            UAP_tensor = T.ToTensor()(UAP_arr)
+            UAP_tensor = generate_tile(img_tensor, UAP_tensor)
+        else:
+            raise NotImplementedError()
+
+        perturbed_tensor = torch.clamp(img_tensor + UAP_tensor, 0, 1)
+        perturbed_image = perturbed_tensor.permute(1, 2, 0).mul(255).byte().numpy() 
+
+        return cv2.cvtColor(perturbed_image, cv2.COLOR_RGB2BGR) 
+
 def semantic_segment_anything_inference(filename, output_path, rank, img=None, save_img=False,
                                  semantic_branch_processor=None,
                                  semantic_branch_model=None,
@@ -160,7 +293,7 @@ def semantic_segment_anything_inference(filename, output_path, rank, img=None, s
 
     anns = {'annotations': mask_branch_model.generate(img)}
     h, w, _ = img.shape
-    class_names = []
+    bitmasks, class_names = [], []
     if model == 'oneformer':
         class_ids = oneformer_func[dataset](Image.fromarray(img), semantic_branch_processor,
                                                                         semantic_branch_model, rank)
@@ -212,11 +345,13 @@ def semantic_segment_anything_inference(filename, output_path, rank, img=None, s
         anns['semantic_mask'][str(sematic_class_in_img[i].item())]['counts'] = anns['semantic_mask'][str(sematic_class_in_img[i].item())]['counts'].decode('utf-8')
     
     if save_img:
+        for ann in anns['annotations']:
+            bitmasks.append(maskUtils.decode(ann['segmentation']))
         imshow_det_bboxes(img,
                             bboxes=None,
-                            labels=np.arange(len(sematic_class_in_img)),
-                            segms=np.stack(semantic_bitmasks),
-                            class_names=semantic_class_names,
+                            labels=np.arange(len(bitmasks)),
+                            segms=np.stack(bitmasks),
+                            class_names=class_names,
                             font_size=25,
                             show=False,
                             out_file=os.path.join(output_path, filename + '_semantic.png'))

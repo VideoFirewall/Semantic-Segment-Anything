@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import argparse
 
@@ -26,7 +27,7 @@ def parse_args():
     return args
 
 def main(rank, args):
-    dist.init_process_group("nccl", rank=rank, world_size=args.world_size)
+    dist.init_process_group("gloo", init_method="env://?use_libuv=False", rank=rank, world_size=args.world_size)
     if args.light_mode:
         clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(rank)
@@ -96,15 +97,25 @@ def main(rank, args):
         print('Total number of files: ', len(filenames))
     local_filenames = filenames[(len(filenames) // args.world_size + 1) * rank : (len(filenames) // args.world_size + 1) * (rank + 1)]
 
-    for file_name in local_filenames:
-        with torch.no_grad():
-            semantic_annotation_pipeline(file_name, args.data_dir, args.out_dir, rank, save_img=args.save_img,
-                                        clip_processor=clip_processor, clip_model=clip_model,
-                                        oneformer_ade20k_processor=oneformer_ade20k_processor, oneformer_ade20k_model=oneformer_ade20k_model,
-                                        oneformer_coco_processor=oneformer_coco_processor, oneformer_coco_model=oneformer_coco_model,
-                                        blip_processor=blip_processor, blip_model=blip_model,
-                                        clipseg_processor=clipseg_processor, clipseg_model=clipseg_model, mask_generator=mask_generator)
-        # torch.cuda.empty_cache()
+    rep = 1
+    runtime = 0
+    for _ in range(rep):
+        start = time.time()
+        for file_name in local_filenames:
+            with torch.no_grad():
+                semantic_annotation_pipeline(file_name, args.data_dir, args.out_dir, rank, save_img=args.save_img,
+                                            clip_processor=clip_processor, clip_model=clip_model,
+                                            oneformer_ade20k_processor=oneformer_ade20k_processor, oneformer_ade20k_model=oneformer_ade20k_model,
+                                            oneformer_coco_processor=oneformer_coco_processor, oneformer_coco_model=oneformer_coco_model,
+                                            blip_processor=blip_processor, blip_model=blip_model,
+                                            clipseg_processor=clipseg_processor, clipseg_model=clipseg_model, mask_generator=mask_generator)
+            # torch.cuda.empty_cache()
+        runtime += time.time() - start
+    mean_runtime = runtime / rep
+    print(f"Runtime of {len(local_filenames)} images of {args.data_dir} folder: {mean_runtime:.2f} seconds")
+    with open("print.txt", "a") as file:
+        file.write(f"Mean runtime of {len(local_filenames)} images of {args.data_dir} folder from {rep} repetitions: {mean_runtime:.2f} seconds. \n")
+
 if __name__ == '__main__':
     args = parse_args()
     if not os.path.exists(args.out_dir):
